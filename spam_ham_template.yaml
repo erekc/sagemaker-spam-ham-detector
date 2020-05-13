@@ -1,0 +1,204 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: 'AWS::Serverless-2016-10-31'
+Description: Spam Ham Serverless
+Parameters:
+    LambdaBucket:
+        Description: The bucket where the lambda function package is stored.
+        Type: String
+    LambdaKey:
+        Description: The key of the lambda zip file
+        Type: String
+    LambdaLayerKey:
+        Description: The key of the numpy layer zip file
+        Type: String
+    EndpointModelName:
+        Description: The name of the model being pushed to endpoint.
+        Type: String
+Resources:
+    SpamHamLambdaRole:
+        Type: AWS::IAM::Role
+        Properties:
+            AssumeRolePolicyDocument:
+                Version: 2012-10-17
+                Statement:
+                    -   Effect: Allow
+                        Principal:
+                            Service: lambda.amazonaws.com
+                        Action: sts:AssumeRole
+            Description: Role for spam-ham-cf
+            Path: /service-role/
+            ManagedPolicyArns:
+                -   arn:aws:iam::aws:policy/AmazonS3FullAccess
+                -   arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryFullAccess
+                -   arn:aws:iam::aws:policy/AmazonEC2ContainerServiceFullAccess
+                -   arn:aws:iam::aws:policy/AmazonSageMakerFullAccess
+                -   arn:aws:iam::aws:policy/CloudWatchFullAccess
+                -   arn:aws:iam::aws:policy/CloudWatchLogsFullAccess
+                -   arn:aws:iam::aws:policy/AmazonSESFullAccess
+    SpamHamManagedPolicy:
+        Type: AWS::IAM::ManagedPolicy
+        Properties:
+            Description: Managed policy for indexing lambda
+            Path: /service-role/
+            Roles:
+                -   !Ref SpamHamLambdaRole
+            PolicyDocument:
+                Version: 2012-10-17
+                Statement:
+                    -   Effect: Allow
+                        Action: logs:CreateLogGroup
+                        Resource: !Sub arn:aws:logs:us-east-1:${AWS::AccountId}:*
+                    -   Effect: Allow
+                        Action:
+                            -   logs:CreateLogStream
+                            -   logs:PutLogEvents
+                        Resource: 
+                            -   !Sub arn:aws:logs:us-east-1:${AWS::AccountId}:log-group:/aws/lambda/spam-ham-cf:*
+    SpamHamSageMakerRole:
+        Type: AWS::IAM::Role
+        Properties:
+            AssumeRolePolicyDocument:
+                Version: 2012-10-17
+                Statement:
+                    -   Effect: Allow
+                        Principal:
+                            Service: sagemaker.amazonaws.com
+                        Action: sts:AssumeRole
+            Description: Role for sagemaker notebook
+            Path: /service-role/
+            ManagedPolicyArns:
+                -   arn:aws:iam::aws:policy/AmazonSageMakerFullAccess
+    SpamHamSageMakerManagedPolicy:
+        Type: AWS::IAM::ManagedPolicy
+        Properties:
+            Description: Managed policy for sagemaker notebook
+            Path: /service-role/
+            Roles:
+                -   !Ref SpamHamSageMakerRole
+            PolicyDocument:
+                Version: 2012-10-17
+                Statement:
+                    -   Action:
+                            -   s3:ListBucket
+                        Effect: Allow
+                        Resource:
+                            -   arn:aws:s3:::spam-ham-notebook-cf
+                    -   Action:
+                            -   s3:GetObject
+                            -   s3:PutObject
+                            -   s3:DeleteObject
+                        Effect: Allow
+                        Resource:
+                            -   arn:aws:s3:::spam-ham-notebook-cf/*
+    SpamHamModelBucket:
+        Type: AWS::S3::Bucket
+        Properties:
+            BucketName: spam-ham-cf
+            PublicAccessBlockConfiguration:
+                BlockPublicAcls: FALSE
+                BlockPublicPolicy: FALSE
+                IgnorePublicAcls: FALSE
+                RestrictPublicBuckets: FALSE
+    SpamHamBucket:
+        Type: AWS::S3::Bucket
+        Properties:
+            BucketName: spam-ham-emails-cf
+            PublicAccessBlockConfiguration:
+                BlockPublicAcls: FALSE
+                BlockPublicPolicy: FALSE
+                IgnorePublicAcls: FALSE
+                RestrictPublicBuckets: FALSE
+    SpamHamBucketPolicy:
+        Type: AWS::S3::BucketPolicy
+        Properties:
+            Bucket: !Ref SpamHamBucket
+            PolicyDocument:
+                Version: 2012-10-17
+                Statement:
+                    -   Action:
+                            -   '*'
+                        Effect: Allow
+                        Resource: !Sub
+                            -   arn:aws:s3:::${PhotoBucket}/*
+                            -   { PhotoBucket: !Ref SpamHamBucket }
+                        Principal: '*'
+                        Sid: PublicReadGetObject
+    SpamHamLambda:
+        Type: AWS::Serverless::Function
+        Properties:
+            FunctionName: spam-ham-cf
+            Handler: lambda_function.lambda_handler
+            Runtime: python3.6
+            CodeUri:
+                Bucket: !Ref LambdaBucket
+                Key: !Ref LambdaKey
+            Description: Lambda for predicting spam or ham for emails.
+            MemorySize: 128
+            Timeout: 30
+            Role: !GetAtt SpamHamLambdaRole.Arn
+            Layers:
+                -   !Ref SpamHamLayer
+            Events:
+                BucketEvent1:
+                    Type: S3
+                    Properties:
+                        Bucket:
+                            Ref: SpamHamBucket
+                        Events: s3:ObjectCreated:Put
+            Environment:
+                Variables:
+                    ModelName: !GetAtt SpamHamEndpoint.EndpointName
+    SpamHamLayer:
+        Type: AWS::Serverless::LayerVersion
+        Properties:
+            CompatibleRuntimes:
+                - python3.6
+            ContentUri:
+                Bucket: !Ref LambdaBucket
+                Key: !Ref LambdaLayerKey
+            Description: numpy
+            LayerName: numpy
+    LambdaInvokePermission:
+        Type: AWS::Lambda::Permission
+        Properties:
+            FunctionName: !GetAtt SpamHamLambda.Arn
+            Action: lambda:InvokeFunction
+            Principal: s3.amazonaws.com
+            SourceAccount: !Sub ${AWS::AccountId}
+            SourceArn: !GetAtt SpamHamBucket.Arn
+    SpamHamRuleSet:
+        Type: AWS::SES::ReceiptRuleSet
+        Properties:
+            RuleSetName: spam-ham-ruleset
+    SpamHamRule:
+        Type: AWS::SES::ReceiptRule
+        Properties:
+            RuleSetName: !Ref SpamHamRuleSet
+            Rule:
+                Name: spam-ham-cf
+                Enabled: TRUE
+                ScanEnabled: TRUE
+                Actions:
+                    -   S3Action:
+                            BucketName: !Ref SpamHamBucket
+    SpamHamNotebook:
+        Type: AWS::SageMaker::NotebookInstance
+        Properties:
+            InstanceType: ml.t2.medium
+            NotebookInstanceName: spam-ham-notebook-cf
+            RoleArn: !GetAtt SpamHamSageMakerRole.Arn
+    SpamHamEndpoint:
+        Type: AWS::SageMaker::Endpoint
+        Properties:
+            EndpointName: spam-ham-endpoint
+            EndpointConfigName: !GetAtt SpamHamEndpointConfig.EndpointConfigName
+    SpamHamEndpointConfig:
+        Type: AWS::SageMaker::EndpointConfig
+        Properties:
+            EndpointConfigName: spam-ham-endpoint-config
+            ProductionVariants:
+                -   VariantName: spam-ham-variant
+                    ModelName: !Ref EndpointModelName
+                    InstanceType: ml.t2.medium
+                    InitialInstanceCount: 1
+                    InitialVariantWeight: 1.0
